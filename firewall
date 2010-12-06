@@ -1,0 +1,293 @@
+# firewall  Bring up or down 
+# chkconfig: 2345 11 90
+# description: Firewall, use /etc/ports.allow as config to allow certain hosts
+# version: 0.2
+# original date: Tue Sep 17 11:58:50 CEST 2002
+# added to git on Mon Dec 6 13:39:43 CEST 2010
+#
+# Only for testing
+#set -x
+
+SETUP=/sbin/iptables
+PRIVPORT=1:1023
+UNPRIVPORT=1024:65535
+ALLPORT=1:65535
+UNIVERSE="0.0.0.0/0"
+
+fw_help()
+{
+	echo 
+	echo "Do not edit anything in this file without permission"
+	echo "This file will be overwritten after each update" 
+	echo
+	echo "It works like this:" 
+	echo "When you want extra ports open, use file: /etc/ports.allow" 
+	echo "Ports out means open for all ip connections to the port"
+	echo "NONE=no access, ALL=All have access or use ip numbers seperated by a ','"
+	echo "priv,unpriv and all can be used instead of port numbers."
+	echo 
+}
+
+fw_stop()
+{
+	logger -t `basename $0`[$$]  "Firewall stopping"
+	$SETUP -P INPUT ACCEPT
+	$SETUP -P OUTPUT ACCEPT
+	$SETUP -P FORWARD DROP
+	$SETUP -F
+	$SETUP -X
+
+	#flush and remove user defined chains
+	chains=`cat /proc/net/ip_tables_names 2>/dev/null`
+
+	for i in $chains
+	do 
+		$SETUP -t $i -F
+	done 
+
+	for i in $chains
+	do
+		$SETUP -t $i -X
+	done 
+
+	for mod in ipt_LOG iptable_nat iptable_filter ip_conntrack ip_conntrack_ftp ipt_limit iptable_mangle ip_tables
+	do
+     		/sbin/rmmod $mod &>/dev/null
+	done
+	logger -t `basename $0`[$$]  "Firewall stopped"
+}
+
+fw_start()
+{
+	logger -t `basename $0`[$$]  "Firewall starting"
+
+	$SETUP -P INPUT DROP
+	$SETUP -P FORWARD DROP
+	$SETUP -P OUTPUT DROP
+	$SETUP -F INPUT 
+	$SETUP -F OUTPUT 
+	$SETUP -F FORWARD 
+
+	#Define log and drop chain
+	$SETUP -N LDROP
+	$SETUP -A LDROP -j LOG --log-level 1 --log-prefix 'iptables: LDROP '
+	$SETUP -A LDROP -j DROP
+
+	# Load iptables module for ftp tracking.
+	/sbin/modprobe ip_conntrack_ftp 
+
+        # Do xen specific stuff.
+        if [ -d /proc/xen ]
+        then
+                IFCONFIG=/tmp/setup_firewall-ifconfig.$$
+                /sbin/ifconfig > $IFCONFIG
+                INTERFACES=`cut -c1-10 $IFCONFIG | grep -v : | grep -v lo`
+
+                for interface in $INTERFACES
+                do
+                        /sbin/ethtool -K $interface tx off
+                done
+        fi
+
+        # Allow total access to al xendomainU, ,each xendomainU has to run its own firewall.
+        if [ -x "/usr/sbin/xm" ]
+        then
+                $SETUP -A FORWARD -m physdev --physdev-in  vif+ -j ACCEPT
+                $SETUP -A FORWARD -m physdev --physdev-out vif+ -j ACCEPT
+        fi
+
+	#Accept everything from localhost
+	$SETUP -A INPUT  -i lo -j ACCEPT 
+	$SETUP -A OUTPUT -o lo -j ACCEPT 
+
+	#Accept all icmp
+	$SETUP -A INPUT  -p icmp -j ACCEPT
+	$SETUP -A OUTPUT -p icmp -j ACCEPT
+
+	########Overall policy#######
+	#Be sure NEW tcp connections are SYN packets 
+	$SETUP -A INPUT -p tcp ! --syn -m state --state NEW -j LDROP
+
+	#Test, drop fragments
+	$SETUP -A INPUT -f -j LOG --log-prefix "IPTABLES FRAGMENTS: " 
+	$SETUP -A INPUT -f -j DROP 
+
+	#Accept incoming rules from /ets/ports.allow
+	for line in `cat /etc/ports.allow | grep  '^in:'`
+	do
+		service=`echo $line | sed -e 's/:/ /g' | awk '{ print $2 }'`
+		proto=`echo $line   | sed -e 's/:/ /g' | awk '{ print $3 }'`
+		port=`echo $line    | sed -e 's/:/ /g' | awk '{ print $4 }'`
+
+      		if [ $port = "priv" ]
+      		then
+       			port="1:1023"
+      		fi
+
+      		if [ $port = "unpriv" ]
+      		then
+       			port="1024:65535"
+      		fi
+
+      		if [ $port = "all" ]
+      		then
+       			port="0:65535"
+      		fi
+
+      		allhosts=`echo $line  | sed -e 's/:/ /g' | awk '{ print $5 }'`
+      		HOSTS=`echo $allhosts | sed -e 's/^.*://'`
+      		HOSTS=`echo $HOSTS    | sed -e 's/,/ /g' | cut -d " " -f 1-`
+
+      		for host in $HOSTS
+      		do
+        		if [ $host = ALL ]
+        		then
+          			host=$UNIVERSE
+        		fi
+
+        		if [ $host != NONE ]
+        		then
+          			if [ $port = 21 ]
+          			then
+             				## FTP 
+             				# Allow ftp inbound.
+             				$SETUP -A INPUT  -p tcp -s $host --dport 21 -m state --state NEW,ESTABLISHED -j ACCEPT
+             				$SETUP -A OUTPUT -p tcp -d $host --sport 21 -m state --state ESTABLISHED -j ACCEPT
+	
+             				# 1) Active ftp. 
+             				$SETUP -A INPUT  -p tcp -s $host --dport 20 -m state --state ESTABLISHED -j ACCEPT
+             				$SETUP -A OUTPUT -p tcp -d $host --sport 20 -m state --state ESTABLISHED,RELATED -j ACCEPT
+	
+             				# 2) Passive ftp. 
+             				$SETUP -A INPUT  -p tcp -s $host --sport $UNPRIVPORT --dport $UNPRIVPORT -m state --state ESTABLISHED,RELATED -j ACCEPT
+            				$SETUP -A OUTPUT -p tcp -d $host --sport $UNPRIVPORT --dport $UNPRIVPORT -m state --state ESTABLISHED -j ACCEPT
+          			else
+             				#$SETUP -A INPUT  -p $proto -s $host --dport $port -m state --state NEW,ESTABLISHED -j ACCEPT
+             				#$SETUP -A OUTPUT -p $proto -d $host --sport $port -m state --state ESTABLISHED -j ACCEPT
+
+             				$SETUP -A INPUT  -p $proto -s $host --dport $port -j ACCEPT
+             				$SETUP -A OUTPUT -p $proto -d $host --sport $port -j ACCEPT
+          			fi
+       			fi
+      		done
+  	done
+
+	#Accept outgoing rules from /etc/hosts.allow, and use /ets/ports.allow
+	for line in `cat /etc/ports.allow | grep  '^out:'`
+  	do
+      		service=`echo $line | sed -e 's/:/ /g' | awk '{ print $2 }'`
+      		proto=`echo $line | sed -e 's/:/ /g' | awk '{ print $3 }'`
+      		port=`echo $line | sed -e 's/:/ /g' | awk '{ print $4 }'`
+
+      		if [ $port = "priv" ]
+      		then
+       			port="1:1023"
+      		fi
+
+      		if [ $port = "unpriv" ]
+      		then
+       			port="1024:65535"
+      		fi
+
+      		if [ $port = "all" ]
+      		then
+       			port="0:65535"
+      		fi
+
+      		allhosts=`echo $line | sed -e 's/:/ /g' | awk '{ print $5 }'`
+      		HOSTS=`echo $allhosts | sed -e 's/^.*://'`
+      		HOSTS=`echo $HOSTS | sed -e 's/,/ /g' | cut -d " " -f 1-`
+      		for host in $HOSTS
+      		do
+        		if [ $host = ALL ]
+        		then
+          			host=$UNIVERSE
+        		fi
+
+        		if [ $host = NONE ]
+        		then
+	     			POLICY=LDROP
+        		else
+	     			POLICY=ACCEPT
+        		fi
+    
+        		if [ $port = 21 ]
+        		then
+
+             			## FTP 
+             			# Allow ftp outbound. 
+             			$SETUP -A INPUT  -p tcp -s $host --sport 21 -m state --state ESTABLISHED -j $POLICY
+             			$SETUP -A OUTPUT -p tcp -d $host --dport 21 -m state --state NEW,ESTABLISHED -j $POLICY
+	
+             			# 1) Active ftp. 
+             			$SETUP -A INPUT  -p tcp -s $host --sport 20 -m state --state ESTABLISHED,RELATED -j $POLICY
+             			$SETUP -A OUTPUT -p tcp -d $host --dport 20 -m state --state ESTABLISHED -j $POLICY
+	
+             			# 2) Passive ftp. 
+             			$SETUP -A INPUT  -p tcp -s $host --sport $UNPRIVPORT --dport $UNPRIVPORT -m state --state ESTABLISHED -j ACCEPT
+             			$SETUP -A OUTPUT -p tcp -d $host --sport $UNPRIVPORT --dport $UNPRIVPORT -m state --state ESTABLISHED,RELATED -j ACCEPT
+        		else
+             			#$SETUP -A INPUT  -p $proto -s $host --sport $port -m state --state ESTABLISHED -j $POLICY
+             			#$SETUP -A OUTPUT -p $proto -d $host --dport $port -m state --state NEW,ESTABLISHED -j $POLICY
+
+             			$SETUP -A INPUT  -p $proto -s $host --sport $port -j $POLICY
+             			$SETUP -A OUTPUT -p $proto -d $host --dport $port -j $POLICY
+        		fi
+     		done  
+  	done
+
+	#Reject AUTH server 
+	# I need to do this for a broken mailhost that won't accept my mail if I just drop its ident probe. 
+  	$SETUP -A INPUT  -p tcp --dport 113 -j REJECT --reject-with tcp-reset 
+  	$SETUP -A OUTPUT -p tcp --dport 113 -j REJECT --reject-with tcp-reset 
+
+	## TRACEROUTE 
+	# Outgoing traceroute anywhere. 
+	# The reply to a traceroute is an icmp time-exceeded which is dealt with by the next rule. 
+  	$SETUP -A INPUT  -p udp --sport $UNPRIVPORT --dport 33434:33523 -m state --state NEW -j ACCEPT 
+  	$SETUP -A OUTPUT -p udp --sport $UNPRIVPORT --dport 33434:33523 -m state --state NEW -j ACCEPT 
+
+	#Drop broadcast before logging 
+  	$SETUP -A INPUT -d 255.255.255.255 -j DROP
+
+	#Drop netbios before logging
+	$SETUP -A INPUT -p tcp --dport 137:139 -j DROP
+	$SETUP -A INPUT -p udp --dport 137:139 -j DROP
+
+	#Drop multicasting before logging 
+	$SETUP -A INPUT -d 224.0.0.1 -j DROP 
+	$SETUP -A OUTPUT -d 224.0.0.1 -j DROP 
+
+	#Reject all tcp connetions to port 25.
+	$SETUP -A INPUT  -p tcp --dport 25 -j REJECT
+
+	#Drop all input/output
+	$SETUP -A INPUT -j LDROP
+	$SETUP -A OUTPUT -j LDROP
+
+	logger -t `basename $0`[$$]  "Firewall started"
+}
+
+
+case "$1" in
+  start)
+       fw_start
+       ;;
+  stop)
+       fw_stop
+       ;;
+  restart)
+       fw_stop
+       sleep 1
+       fw_start
+       ;;
+  help)
+       fw_help
+       ;;
+  status)
+       $SETUP -L -n 
+       ;;
+  *)
+       echo "Usage: `basename $0` {start|stop|restart|status|help}"
+       exit 1
+esac

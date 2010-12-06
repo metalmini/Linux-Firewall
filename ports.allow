@@ -1,0 +1,25 @@
+#
+# ports.allow	This file describes the names of the hosts which are
+#		allowed to use the local INET services, as decided
+#		by the '/usr/sbin/tcpd' server.
+#NOTE THIS FILE IS ALSO USED BY THE FIREWALL
+#direction:name:proto:port:ip1,ip2,ip3
+#NONE and ALL are also valid in the ip column
+
+in:ident:tcp:113:NONE
+
+# Some examples
+out:snmp:udp:161:ALL
+out:snmp:tcp:161:ALL
+out:ssh:tcp:22:ALL
+out:postfix:tcp:25:ALL
+out:pop3:tcp:110:ALL
+out:imap:tcp:143:ALL
+out:mysqld:tcp:3306:ALL
+out:ftp:tcp:21:ALL
+out:http:tcp:80:ALL
+out:https:tcp:443:ALL
+out:dns:udp:53:ALL
+out:dns:tcp:53:ALL
+out:ntp:udp:123:ALL
+
